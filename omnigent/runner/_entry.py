@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from omnigent.runner.app import ResolvedSpec
+    from omnigent.runner.session_init_protocol import RunnerSessionInitAgentBundle
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
 _RUNNER_SERVER_URL_ENV_VAR = "RUNNER_SERVER_URL"
@@ -881,6 +883,59 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     return dest
 
 
+def _materialize_agent_spec_bundle(
+    spec_cache_root: Path,
+    agent_id: str,
+    contents: bytes,
+    *,
+    version: str,
+    session_scoped: bool,
+) -> ResolvedSpec:
+    """Extract, cache, and parse agent bundle bytes supplied by any transport."""
+    from omnigent.runner.app import ResolvedSpec
+    from omnigent.spec import load
+
+    expand_env = not session_scoped
+    dest = _agent_cache_dest(spec_cache_root, agent_id, version)
+    # The server already validated the bundle. If this runner is older, prune
+    # sub-agents using harnesses it does not yet understand instead of failing
+    # the entire parent-agent dispatch.
+    if not dest.exists():
+        dest.mkdir(parents=True)
+        try:
+            load(contents, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+        except Exception:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise
+    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    return ResolvedSpec(spec=spec, workdir=dest)
+
+
+def _resolve_agent_spec_from_embedded_bundle(
+    spec_cache_root: Path,
+    agent_id: str,
+    bundle: RunnerSessionInitAgentBundle,
+) -> ResolvedSpec:
+    """Decode and materialize an agent bundle supplied during initialization."""
+    from omnigent.runner.session_init_protocol import decode_runner_session_init_agent_bundle
+
+    contents = decode_runner_session_init_agent_bundle(bundle)
+    resolved = _materialize_agent_spec_bundle(
+        spec_cache_root,
+        agent_id,
+        contents,
+        version=bundle.version,
+        session_scoped=bundle.session_scoped,
+    )
+    _logger.info(
+        "Agent spec resolved from session initialization bundle: agent=%s version=%s bytes=%d",
+        agent_id,
+        bundle.version,
+        len(contents),
+    )
+    return resolved
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
     spec_cache_root: Path,
@@ -906,9 +961,6 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404.
     """
-    from omnigent.runner.app import ResolvedSpec
-    from omnigent.spec import load
-
     if session_id is None:
         _logger.warning(
             "spec_resolver called without session_id for agent %s; "
@@ -934,24 +986,18 @@ async def _resolve_agent_spec_from_server(
     # a missing/unknown header is treated as session-scoped (no
     # expansion). Only operator-authored template agents expand.
     session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
-    expand_env = session_scoped_header == "false"
+    session_scoped = session_scoped_header != "false"
     # Cache key: agent id + version header. Re-extracting on
     # every dispatch would be wasteful; keying by version means
     # PUT-induced bundle bumps invalidate naturally.
     version = resp.headers.get("X-Agent-Version", "0")
-    dest = _agent_cache_dest(spec_cache_root, agent_id, version)
-    # prune_invalid_sub_agents: the server already validated this bundle
-    # before serving it, so a sub-agent that fails validation *here* means
-    # this runner is older than that server and can't run that sub-agent
-    # (e.g. it names a harness this version doesn't know). Drop the
-    # unsupported sub-agent and launch the parent with what this runner
-    # *does* support, rather than failing every dispatch of the agent.
-    # See omnigent.spec.load.
-    if not dest.exists():
-        dest.mkdir(parents=True)
-        load(resp.content, dest=dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    return ResolvedSpec(spec=spec, workdir=dest)
+    return _materialize_agent_spec_bundle(
+        spec_cache_root,
+        agent_id,
+        resp.content,
+        version=version,
+        session_scoped=session_scoped,
+    )
 
 
 def create_app(
@@ -1080,6 +1126,17 @@ def create_app(
             session_id=session_id,
         )
 
+    async def init_spec_resolver(
+        agent_id: str,
+        bundle: RunnerSessionInitAgentBundle,
+    ) -> ResolvedSpec:
+        """Materialize the agent archive coalesced into session initialization."""
+        return _resolve_agent_spec_from_embedded_bundle(
+            _spec_cache_root,
+            agent_id,
+            bundle,
+        )
+
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
@@ -1106,6 +1163,7 @@ def create_app(
     app = create_runner_app(
         process_manager=pm,
         spec_resolver=spec_resolver,
+        init_spec_resolver=init_spec_resolver,
         server_client=server_client,
         terminal_registry=_terminal_registry,
         runner_workspace=runner_workspace,

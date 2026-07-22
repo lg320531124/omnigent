@@ -80,6 +80,7 @@ from omnigent.runner.resource_registry import (
     TerminalLifecycle,
 )
 from omnigent.runner.session_init_protocol import (
+    RunnerSessionInitAgentBundle,
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
 )
@@ -204,6 +205,7 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
 
 
 SpecResolver = Callable[[str, str | None], Awaitable[Any | None]]
+InitSpecResolver = Callable[[str, RunnerSessionInitAgentBundle], Awaitable[Any | None]]
 _NO_BODY_STATUS_CODES = {204, 304}
 _SUBAGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -8096,6 +8098,7 @@ def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
     spec_resolver: SpecResolver | None = None,
+    init_spec_resolver: InitSpecResolver | None = None,
     server_client: httpx.AsyncClient,
     terminal_registry: Any | None = None,
     resource_registry: SessionResourceRegistry | None = None,
@@ -8113,6 +8116,9 @@ def create_runner_app(
         For in-process: wraps the server's agent cache.
         For out-of-process: wraps HTTP fetch to GET /v1/agents/{id}/contents.
         ``None`` → runner falls back to body-supplied hints (test path).
+    :param init_spec_resolver: Optional callback that materializes an agent
+        archive embedded in the initialization envelope. Failures fall back to
+        ``spec_resolver`` for compatibility and resilience.
     :param server_client: httpx.AsyncClient pointed at the AP
         server's public API. Used by the runner for
         elicitation/approval forwarding.
@@ -9184,7 +9190,21 @@ def create_runner_app(
         # cache it for resource endpoints (filesystem, terminals)
         # that may fire before the first turn dispatches.
         spec = None
-        if spec_resolver is not None:
+        embedded_bundle = (
+            init_context.envelope.agent_bundle if init_context.envelope is not None else None
+        )
+        if embedded_bundle is not None and init_spec_resolver is not None:
+            try:
+                spec = await init_spec_resolver(agent_id, embedded_bundle)
+            except Exception:  # noqa: BLE001 - retry through the legacy HTTP path
+                _logger.warning(
+                    "Embedded agent bundle resolution failed; falling back to HTTP: "
+                    "session=%s agent=%s",
+                    session_id,
+                    agent_id,
+                    exc_info=True,
+                )
+        if spec is None and spec_resolver is not None:
             try:
                 spec = await spec_resolver(agent_id, session_id)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:

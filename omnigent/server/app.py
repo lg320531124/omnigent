@@ -1241,6 +1241,8 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        agent_store=agent_store,
+        artifact_store=artifact_store,
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``

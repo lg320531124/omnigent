@@ -28,6 +28,7 @@ from omnigent.runner._entry import (
     _mint_managed_owner_token,
     _parent_is_orphaned,
     _parent_process_is_alive,
+    _resolve_agent_spec_from_embedded_bundle,
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
     _run_parent_death_killer,
@@ -42,7 +43,9 @@ from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
+from omnigent.runner.session_init_protocol import encode_runner_session_init_agent_bundle
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.spec import ExtractionError
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -1619,6 +1622,43 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
     assert cache_dir.is_dir()
     assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
     assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+
+
+def test_resolve_embedded_agent_bundle_recovers_after_invalid_archive(tmp_path: Path) -> None:
+    """A bad coalesced archive does not poison the cache used by HTTP fallback."""
+    invalid = encode_runner_session_init_agent_bundle(
+        b"not a tarball",
+        version="7",
+        name="cached-agent",
+        session_scoped=True,
+    )
+    assert invalid is not None
+
+    with pytest.raises(ExtractionError):
+        _resolve_agent_spec_from_embedded_bundle(tmp_path, "ag_cached", invalid)
+
+    assert list(tmp_path.iterdir()) == []
+
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    valid = encode_runner_session_init_agent_bundle(
+        bundle_buf.getvalue(),
+        version="7",
+        name="cached-agent",
+        session_scoped=True,
+    )
+    assert valid is not None
+
+    resolved = _resolve_agent_spec_from_embedded_bundle(tmp_path, "ag_cached", valid)
+
+    assert resolved.name == "cached-agent"
+    assert (tmp_path / "ag_cached-v7" / "config.yaml").is_file()
 
 
 @pytest.mark.asyncio

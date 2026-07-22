@@ -50,6 +50,7 @@ from omnigent.entities.session_resources import SessionResourceView, terminal_re
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
+from omnigent.runner._entry import _resolve_agent_spec_from_embedded_bundle
 from omnigent.runner.app import (
     _RUNNER_DISPATCHED_FIELD,
     _WAKE_POST_MAX_ATTEMPTS,
@@ -4423,6 +4424,120 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
     assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_resolves_embedded_agent_bundle_without_http_fallback() -> None:
+    """A current runner consumes coalesced bundle data before its HTTP resolver."""
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    embedded_calls = 0
+    http_calls = 0
+
+    async def _init_resolver(agent_id: str, bundle: Any) -> AgentSpec:
+        nonlocal embedded_calls
+        embedded_calls += 1
+        assert agent_id == "agent_embedded"
+        assert bundle.name == "coalesced-agent"
+        assert bundle.version == "4"
+        return AgentSpec(spec_version=1, name="coalesced-agent")
+
+    async def _http_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal http_calls
+        del agent_id, session_id
+        http_calls += 1
+        raise AssertionError("embedded bundle unexpectedly fell back to HTTP")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_http_resolver,
+        init_spec_resolver=_init_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    payload = {
+        "session_id": "conv_embedded",
+        "agent_id": "agent_embedded",
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": "conv_embedded",
+            "agent_id": "agent_embedded",
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "labels": {},
+            },
+            "agent_bundle": {
+                "version": "4",
+                "name": "coalesced-agent",
+                "session_scoped": True,
+                "contents_base64": "YnVuZGxl",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+
+    assert response.status_code == 201
+    assert embedded_calls == 1
+    assert http_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_create_session_falls_back_when_embedded_agent_bundle_is_invalid(
+    tmp_path: Path,
+) -> None:
+    """Corrupt coalesced data retains the established HTTP resolution path."""
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    http_calls = 0
+
+    async def _invalid_init_resolver(agent_id: str, bundle: Any) -> AgentSpec:
+        return _resolve_agent_spec_from_embedded_bundle(tmp_path, agent_id, bundle)
+
+    async def _http_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal http_calls
+        assert agent_id == "agent_fallback"
+        assert session_id == "conv_fallback"
+        http_calls += 1
+        return AgentSpec(spec_version=1, name="fallback-agent")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_http_resolver,
+        init_spec_resolver=_invalid_init_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    payload = {
+        "session_id": "conv_fallback",
+        "agent_id": "agent_fallback",
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": "conv_fallback",
+            "agent_id": "agent_fallback",
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "labels": {},
+            },
+            "agent_bundle": {
+                "version": "4",
+                "name": "broken-agent",
+                "session_scoped": True,
+                "contents_base64": "not-valid-base64",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+
+    assert response.status_code == 201
+    assert http_calls == 1
 
 
 @pytest.mark.asyncio

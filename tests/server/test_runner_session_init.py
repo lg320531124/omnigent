@@ -8,7 +8,13 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.entities import Conversation
+from omnigent.entities import Agent, Conversation
+from omnigent.runner.session_init_protocol import (
+    MAX_EMBEDDED_AGENT_BUNDLE_BYTES,
+    RunnerSessionInitAgentBundle,
+    decode_runner_session_init_agent_bundle,
+    encode_runner_session_init_agent_bundle,
+)
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 
 
@@ -47,6 +53,27 @@ def _conversation() -> Conversation:
     )
 
 
+class _AgentStore:
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+        self.calls = 0
+
+    def get(self, agent_id: str) -> Agent | None:
+        self.calls += 1
+        return self.agent if agent_id == self.agent.id else None
+
+
+class _ArtifactStore:
+    def __init__(self, contents: bytes) -> None:
+        self.contents = contents
+        self.calls = 0
+
+    def get(self, key: str) -> bytes:
+        assert key == "agents/agent_init/bundle.tar.gz"
+        self.calls += 1
+        return self.contents
+
+
 @pytest.mark.asyncio
 async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     registry = _Registry()
@@ -75,6 +102,58 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     initializer.invalidate_runner("runner_init")
     await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_initializer_embeds_agent_bundle_inside_single_flight_request() -> None:
+    registry = _Registry()
+    client = _Client()
+    contents = b"compressed-agent-bundle"
+    agent_store = _AgentStore(
+        Agent(
+            id="agent_init",
+            created_at=1,
+            name="embedded-agent",
+            bundle_location="agents/agent_init/bundle.tar.gz",
+            version=7,
+            session_id="conv_init",
+        )
+    )
+    artifact_store = _ArtifactStore(contents)
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+        agent_store=agent_store,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
+    )
+
+    first = asyncio.create_task(initializer.initialize(_conversation(), client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    second = asyncio.create_task(initializer.initialize(_conversation(), client, timeout=10))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    client.release.set()
+    await asyncio.gather(first, second)
+
+    assert agent_store.calls == 1
+    assert artifact_store.calls == 1
+    assert len(client.calls) == 1
+    embedded = client.calls[0]["session_init"]["agent_bundle"]
+    assert embedded["version"] == "7"
+    assert embedded["name"] == "embedded-agent"
+    assert embedded["session_scoped"] is True
+    encoded = RunnerSessionInitAgentBundle.model_validate(embedded)
+    assert decode_runner_session_init_agent_bundle(encoded) == contents
+
+
+def test_oversized_agent_bundle_is_omitted() -> None:
+    bundle = encode_runner_session_init_agent_bundle(
+        b"x" * (MAX_EMBEDDED_AGENT_BUNDLE_BYTES + 1),
+        version="1",
+        name="large-agent",
+        session_scoped=False,
+    )
+
+    assert bundle is None
 
 
 @pytest.mark.asyncio
