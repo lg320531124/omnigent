@@ -896,7 +896,7 @@ def test_codex_native_worktree_session_runs_in_worktree(
 
     Regression for the bug where codex-native resolved its terminal cwd
     from ``ResolvedSpec.workdir`` — the runner's spec-bundle extraction
-    dir (``runner-specs-<id>/ag_<id>-v<ver>``) — instead of the session
+    dir (``runner-specs-<id>/agent-<digest>``) — instead of the session
     workspace. Worktree sessions therefore launched Codex in a temp dir
     with no ``.git`` and never touched the worktree, while claude-native
     worked because it reads ``OMNIGENT_RUNNER_WORKSPACE`` directly.

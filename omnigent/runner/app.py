@@ -650,7 +650,7 @@ def _codex_session_workspace(session_workspace: str | None) -> Path:
 
     Deliberately does NOT consult ``ResolvedSpec.workdir`` — in the
     out-of-process runner that is the agent-bundle extraction dir
-    (``runner-specs-<id>/ag_<id>-v<ver>``), not the repo, so using it
+    (``runner-specs-<id>/agent-<digest>``), not the repo, so using it
     stranded Codex in a temp dir with no ``.git`` (and ignored the
     worktree entirely).
 

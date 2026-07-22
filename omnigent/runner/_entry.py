@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import shutil
@@ -861,10 +862,9 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
     """
     Compute the cache directory for an agent bundle, contained to the root.
 
-    ``agent_id`` and the version header are server-provided but treated as
-    untrusted path components: path separators are stripped and the result is
-    verified to stay within *spec_cache_root* so a crafted id/version cannot
-    traverse out of the cache root (defense-in-depth against path injection).
+    ``agent_id`` and the version header are server-provided. Hash them into a
+    fixed hexadecimal component so untrusted text never becomes filesystem
+    syntax, then verify the result remains within *spec_cache_root*.
 
     :param spec_cache_root: Runner-local cache root for extracted bundles,
         e.g. ``Path("/tmp/runner-specs-xyz")``.
@@ -875,7 +875,8 @@ def _agent_cache_dest(spec_cache_root: Path, agent_id: str, version: str) -> Pat
         *spec_cache_root*.
     :raises RuntimeError: If the computed path escapes *spec_cache_root*.
     """
-    cache_key = f"{agent_id}-v{version}".replace("/", "_").replace("\\", "_")
+    cache_identity = f"{len(agent_id)}:{agent_id}{version}".encode()
+    cache_key = f"agent-{hashlib.sha256(cache_identity).hexdigest()}"
     cache_root = spec_cache_root.resolve()
     dest = (cache_root / cache_key).resolve()
     if not dest.is_relative_to(cache_root):
@@ -907,7 +908,11 @@ def _materialize_agent_spec_bundle(
         except Exception:
             shutil.rmtree(dest, ignore_errors=True)
             raise
-    spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return ResolvedSpec(spec=spec, workdir=dest)
 
 

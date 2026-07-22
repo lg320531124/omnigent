@@ -1618,10 +1618,10 @@ async def test_resolve_agent_spec_from_server_caches_success_by_agent_version(
         "/v1/sessions/conv_test/agent/contents",
         "/v1/sessions/conv_test/agent/contents",
     ]
-    cache_dir = tmp_path / "ag_cached-v7"
+    cache_dir = _agent_cache_dest(tmp_path, "ag_cached", "7")
     assert cache_dir.is_dir()
     assert (cache_dir / "config.yaml").read_text() == config_bytes.decode()
-    assert [path.name for path in tmp_path.iterdir()] == ["ag_cached-v7"]
+    assert [path.name for path in tmp_path.iterdir()] == [cache_dir.name]
 
 
 def test_resolve_embedded_agent_bundle_recovers_after_invalid_archive(tmp_path: Path) -> None:
@@ -1658,7 +1658,48 @@ def test_resolve_embedded_agent_bundle_recovers_after_invalid_archive(tmp_path: 
     resolved = _resolve_agent_spec_from_embedded_bundle(tmp_path, "ag_cached", valid)
 
     assert resolved.name == "cached-agent"
-    assert (tmp_path / "ag_cached-v7" / "config.yaml").is_file()
+    assert (_agent_cache_dest(tmp_path, "ag_cached", "7") / "config.yaml").is_file()
+
+
+def test_resolve_embedded_agent_bundle_cleans_failed_cached_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached-directory parse failure removes the poisoned cache entry."""
+    from omnigent import spec as spec_module
+
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+    bundle = encode_runner_session_init_agent_bundle(
+        bundle_buf.getvalue(),
+        version="8",
+        name="cached-agent",
+        session_scoped=True,
+    )
+    assert bundle is not None
+
+    real_load = spec_module.load
+    load_calls = 0
+
+    def _fail_cached_parse(*args: Any, **kwargs: Any) -> Any:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 2:
+            raise RuntimeError("cached parse failed")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(spec_module, "load", _fail_cached_parse)
+
+    with pytest.raises(RuntimeError, match="cached parse failed"):
+        _resolve_agent_spec_from_embedded_bundle(tmp_path, "ag_cached", bundle)
+
+    assert not _agent_cache_dest(tmp_path, "ag_cached", "8").exists()
 
 
 @pytest.mark.asyncio
@@ -1922,10 +1963,10 @@ def test_agent_cache_dest_contains_traversal(tmp_path: Path, agent_id: str, vers
 
 
 def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
-    """A normal agent id/version maps to the expected child directory.
+    """A normal agent id/version maps deterministically to one safe child.
 
-    Proves the sanitization doesn't mangle well-formed ids — only the
-    f-string shape changes for traversal inputs.
+    The opaque digest keeps the same agent/version pair stable for cache hits
+    while ensuring a version bump maps to a different directory.
 
     :param tmp_path: Cache root fixture.
     """
@@ -1933,5 +1974,11 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     cache_root.mkdir()
 
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
+    repeated = _agent_cache_dest(cache_root, "ag_abc123", "3")
+    next_version = _agent_cache_dest(cache_root, "ag_abc123", "4")
 
-    assert dest == cache_root / "ag_abc123-v3"
+    assert dest == repeated
+    assert dest != next_version
+    assert dest.parent == cache_root
+    assert dest.name.startswith("agent-")
+    assert len(dest.name) == len("agent-") + 64
