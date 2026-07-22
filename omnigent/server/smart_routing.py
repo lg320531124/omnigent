@@ -497,6 +497,71 @@ class ExternalRoutingClient:
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+# SDK harnesses offered as candidates when the user picks "auto" harness.
+# Ordered by preference for the fallback model-ownership search.
+# Native harnesses are excluded: they require CLI binaries that may not be
+# installed, and they bake the model at terminal launch rather than per-turn.
+_AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "pi", "codex")
+
+
+async def route_session_harness(
+    user_message: str,
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """Pick the best harness + model for a new session via the routing client.
+
+    Builds a candidate set from the static model catalog for all SDK harnesses
+    that have known model lists (``_AUTO_ROUTING_HARNESSES``) and delegates to
+    the configured :attr:`RuntimeCaps.routing_client`.
+
+    :param user_message: The user's first message text, used to size the task.
+    :returns: ``(harness, model, verdict)`` on success; ``(None, None, None)``
+        when routing is unavailable, the message is empty, or the router fails.
+    """
+    if not user_message:
+        return None, None, None
+    try:
+        from omnigent.runtime._globals import _caps
+    except ImportError:
+        return None, None, None
+
+    if _caps is None or _caps.routing_client is None:
+        return None, None, None
+
+    harness_models: dict[str, list[str]] = {}
+    for h in _AUTO_ROUTING_HARNESSES:
+        models = infer_models(h)
+        if models:
+            harness_models[h] = models
+
+    if not harness_models:
+        return None, None, None
+
+    try:
+        result = await _caps.routing_client.route(user_message, harness_models)
+    except Exception:  # routing failures must not block session creation
+        _logger.exception("smart_routing: route_session_harness failed")
+        return None, None, None
+
+    if result is None:
+        return None, None, None
+
+    # Use the router's harness pick when it names one of our candidates;
+    # otherwise fall back to the harness that owns the returned model.
+    chosen_harness = result.harness if result.harness in harness_models else None
+    if chosen_harness is None:
+        for h, models in harness_models.items():
+            if result.model in models:
+                chosen_harness = h
+                break
+
+    _logger.info(
+        "smart_routing: auto-harness harness=%s model=%s rationale=%s",
+        chosen_harness,
+        result.model,
+        result.rationale,
+    )
+    return chosen_harness, result.model, {"model": result.model, "rationale": result.rationale}
+
 
 async def route_turn(
     harness: str | None,

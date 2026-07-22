@@ -3068,6 +3068,66 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         return None
 
 
+async def _resolve_auto_harness_and_model(
+    initial_items: list[Any],
+) -> tuple[str | None, str | None]:
+    """Resolve an ``"auto"`` harness_override via the intelligent router.
+
+    Extracts user-message text from *initial_items*, calls
+    :func:`~omnigent.server.smart_routing.route_session_harness` with the full
+    SDK harness catalog, and returns ``(harness, model)``.  Either or both
+    may be ``None`` when routing is unavailable or no text is present — the
+    caller falls back to ``(None, None)`` (spec defaults).
+
+    :param initial_items: The session-create request's ``initial_items`` list.
+    :returns: ``(canonical_harness, model_id)`` or ``(None, None)``.
+    """
+    from omnigent.server.smart_routing import route_session_harness
+
+    # Extract user text from the first user message in initial_items.
+    parts: list[str] = []
+    for item in initial_items:
+        data = getattr(item, "data", None) or {}
+        if not isinstance(data, dict) or data.get("role") != "user":
+            continue
+        content = data.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "input_text":
+                    text = block.get("text", "")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+        elif isinstance(content, str) and content:
+            parts.append(content)
+    user_text = " ".join(parts)[:4000]
+
+    if not user_text:
+        return None, None
+
+    harness, model, _verdict = await route_session_harness(user_text)
+
+    # Validate the resolved harness is known before storing it.
+    if harness is not None:
+        try:
+            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
+
+            canonical = canonicalize_harness(harness) or harness
+            if canonical not in OMNIGENT_HARNESSES:
+                _logger.warning(
+                    "auto-harness: router returned unknown harness %r; ignoring", harness
+                )
+                harness = None
+                model = None
+            else:
+                harness = canonical
+        except Exception:  # noqa: BLE001 — validation failure falls back to defaults
+            harness = None
+            model = None
+
+    return harness, model
+
+
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     """
     Validate + canonicalize a session-create ``harness_override``.
@@ -12967,9 +13027,18 @@ async def _create_session_from_existing_agent(
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
-    harness_override = await asyncio.to_thread(
-        _validated_harness_override, body.harness_override, agent
-    )
+    # The special sentinel "auto" triggers router-based harness + model
+    # selection; it resolves before the row is created so the DB never
+    # stores "auto" as a literal value.
+    if body.harness_override == "auto":
+        _auto_harness, _auto_model = await _resolve_auto_harness_and_model(body.initial_items)
+        harness_override = _auto_harness  # None = spec default harness
+        if _auto_model is not None and model_override is None:
+            model_override = _auto_model
+    else:
+        harness_override = await asyncio.to_thread(
+            _validated_harness_override, body.harness_override, agent
+        )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).

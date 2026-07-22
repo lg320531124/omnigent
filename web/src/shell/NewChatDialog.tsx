@@ -1790,7 +1790,7 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  const brainHarnessLabels = useBrainHarnessLabels();
+  // brainHarnessLabels is declared after smartRoutingEnabled (see below).
   const { data: hosts, isLoading: hostsLoading } = useHosts();
 
   const agentList = useMemo(
@@ -1880,6 +1880,7 @@ export function NewChatLandingScreen() {
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
+  const brainHarnessLabels = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.

@@ -14,11 +14,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from omnigent.server.smart_routing import (
+    _AUTO_ROUTING_HARNESSES,
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
     fetch_runner_models,
     infer_models,
+    route_session_harness,
     route_turn,
 )
 
@@ -713,3 +715,79 @@ async def test_external_routing_client_sends_bearer_auth() -> None:
     with _patch_httpx(httpx.MockTransport(handler)):
         await client.route("hi", {"h": ["m"]})
     assert captured["authorization"] == "Bearer dapi-XYZ"
+
+
+# ── route_session_harness ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_picks_harness_and_model() -> None:
+    """route_session_harness returns (harness, model, verdict) from the router."""
+    expected = RoutingResult(
+        model="databricks-claude-opus-4-8",
+        rationale="complex codebase task",
+        harness="claude-sdk",
+    )
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict = await route_session_harness("refactor the auth module")
+    assert harness == "claude-sdk"
+    assert model == "databricks-claude-opus-4-8"
+    assert verdict is not None
+    assert "rationale" in verdict
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_passes_all_sdk_harnesses() -> None:
+    """route_session_harness includes all _AUTO_ROUTING_HARNESSES in the candidate set."""
+    received_harnesses: list[str] = []
+
+    class _CapturingClient:
+        async def route(
+            self, _message: str, available_models: dict[str, list[str]]
+        ) -> RoutingResult | None:
+            received_harnesses.extend(available_models.keys())
+            return RoutingResult(model="databricks-claude-haiku-4-5", rationale="x", harness="pi")
+
+    caps = _FakeCaps(routing_client=_CapturingClient())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        await route_session_harness("quick task")
+    for h in _AUTO_ROUTING_HARNESSES:
+        assert h in received_harnesses, f"harness {h!r} missing from candidate set"
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_returns_none_when_no_client() -> None:
+    """route_session_harness returns (None, None, None) when no routing client."""
+    caps = _FakeCaps(routing_client=None)
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict = await route_session_harness("hello")
+    assert harness is None
+    assert model is None
+    assert verdict is None
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_returns_none_for_empty_message() -> None:
+    """route_session_harness returns (None, None, None) for empty user text."""
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(None))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict = await route_session_harness("")
+    assert harness is None
+    assert model is None
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_falls_back_by_model_when_harness_absent() -> None:
+    """When the router returns no harness, fall back to finding it by model."""
+    expected = RoutingResult(
+        model="databricks-gpt-5-4-nano",
+        rationale="cheap task",
+        harness=None,  # router did not name a harness
+    )
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict = await route_session_harness("what time is it?")
+    # databricks-gpt-5-4-nano is in codex and pi model lists; first match wins
+    assert harness in ("codex", "pi")
+    assert model == "databricks-gpt-5-4-nano"
