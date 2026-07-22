@@ -9193,6 +9193,8 @@ def create_runner_app(
         embedded_bundle = (
             init_context.envelope.agent_bundle if init_context.envelope is not None else None
         )
+        if init_context.envelope is not None:
+            init_context.envelope.agent_bundle = None
         if embedded_bundle is not None and init_spec_resolver is not None:
             try:
                 spec = await init_spec_resolver(agent_id, embedded_bundle)
@@ -9204,6 +9206,7 @@ def create_runner_app(
                     agent_id,
                     exc_info=True,
                 )
+        embedded_bundle = None
         if spec is None and spec_resolver is not None:
             try:
                 spec = await spec_resolver(agent_id, session_id)

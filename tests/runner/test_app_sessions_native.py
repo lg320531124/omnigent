@@ -4427,12 +4427,31 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
 
 
 @pytest.mark.asyncio
-async def test_create_session_resolves_embedded_agent_bundle_without_http_fallback() -> None:
+async def test_create_session_resolves_embedded_agent_bundle_without_http_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A current runner consumes coalesced bundle data before its HTTP resolver."""
+    import omnigent.runner.app as runner_app_module
+
     harness_client = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(harness_client)
     embedded_calls = 0
     http_calls = 0
+    parsed_envelopes: list[RunnerSessionInitEnvelope] = []
+
+    original_parse = runner_app_module.parse_runner_session_init_envelope
+
+    def _capture_envelope(body: dict[str, Any]) -> RunnerSessionInitEnvelope | None:
+        envelope = original_parse(body)
+        if envelope is not None:
+            parsed_envelopes.append(envelope)
+        return envelope
+
+    monkeypatch.setattr(
+        runner_app_module,
+        "parse_runner_session_init_envelope",
+        _capture_envelope,
+    )
 
     async def _init_resolver(agent_id: str, bundle: Any) -> AgentSpec:
         nonlocal embedded_calls
@@ -4483,6 +4502,8 @@ async def test_create_session_resolves_embedded_agent_bundle_without_http_fallba
     assert response.status_code == 201
     assert embedded_calls == 1
     assert http_calls == 0
+    assert len(parsed_envelopes) == 1
+    assert parsed_envelopes[0].agent_bundle is None
 
 
 @pytest.mark.asyncio
