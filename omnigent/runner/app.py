@@ -8217,6 +8217,9 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
+    # Readers can arrive before POST /v1/sessions. Keep them behind that
+    # assignment so it alone chooses embedded vs HTTP resolution.
+    _session_init_spec_ready: dict[str, asyncio.Event] = {}
     # Full session initialization is single-flight. The key includes the
     # assignment identity so a legacy reconnect request that omits a child
     # name cannot hide a later, correctly identified sub-agent assignment.
@@ -9370,6 +9373,10 @@ def create_runner_app(
             harness_name = "runner-test-default"
             spawn_env = None
 
+        # Release readers after the assignment caches its chosen spec source.
+        # Legacy assignments reach this point after their HTTP fetch.
+        _session_init_spec_ready.setdefault(session_id, asyncio.Event()).set()
+
         try:
             await process_manager.get_client(
                 session_id,
@@ -10139,6 +10146,7 @@ def create_runner_app(
         )
         task = _session_init_tasks.get(key)
         if task is None:
+            spec_ready = _session_init_spec_ready.setdefault(session_id, asyncio.Event())
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
@@ -10146,6 +10154,8 @@ def create_runner_app(
             _session_init_tasks[key] = task
 
             def _drop_completed_init(done: asyncio.Task[JSONResponse]) -> None:
+                # Errors can return before the normal spec-ready point.
+                spec_ready.set()
                 if _session_init_tasks.get(key) is done:
                     _session_init_tasks.pop(key, None)
 
@@ -10368,6 +10378,7 @@ def create_runner_app(
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
+        _session_init_spec_ready.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
@@ -17944,10 +17955,9 @@ def create_runner_app(
         than the unwrapped spec, so callers that need the materialized
         bundle workdir — e.g. skill discovery — can read it via
         :func:`_resolved_spec_workdir`. Resource access can happen
-        before the first turn dispatches, so the harness process
-        manager may not have loaded the session's spec yet; this reads
-        the shared :func:`_session_snapshot` for the session's
-        ``agent_id`` and reuses the normal ``spec_resolver`` path.
+        before session assignment finishes. Those readers wait for
+        ``POST /v1/sessions`` to cache its embedded bundle or legacy
+        HTTP result. Later cache misses reuse the normal resolver path.
 
         A per-session lock makes resolution single-flight: a startup
         burst of concurrent callers resolves the bundle once and the
@@ -17963,6 +17973,12 @@ def create_runner_app(
         :raises OmnigentError: If the server returns malformed data
             or the referenced agent cannot be resolved.
         """
+        if session_id in _session_spec_cache:
+            return _session_spec_cache[session_id]
+        # Routing starts before the server's connection callback, so a resource
+        # request can arrive first. Let session assignment choose the source.
+        spec_ready = _session_init_spec_ready.setdefault(session_id, asyncio.Event())
+        await spec_ready.wait()
         if session_id in _session_spec_cache:
             return _session_spec_cache[session_id]
         if spec_resolver is None:

@@ -4507,6 +4507,144 @@ async def test_create_session_resolves_embedded_agent_bundle_without_http_fallba
 
 
 @pytest.mark.asyncio
+async def test_spec_reader_waits_for_embedded_session_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resource reader cannot race an incoming embedded bundle with HTTP."""
+    import omnigent.model_catalog as model_catalog
+
+    monkeypatch.setattr(model_catalog, "catalog_for_spec", lambda _spec: {})
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    embedded_entered = asyncio.Event()
+    release_embedded = asyncio.Event()
+    http_calls = 0
+
+    async def _init_resolver(agent_id: str, bundle: Any) -> AgentSpec:
+        assert agent_id == "agent_rendezvous"
+        assert bundle.name == "rendezvous-agent"
+        embedded_entered.set()
+        await release_embedded.wait()
+        return AgentSpec(spec_version=1, name="rendezvous-agent")
+
+    async def _http_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal http_calls
+        del agent_id, session_id
+        http_calls += 1
+        raise AssertionError("resource reader raced session initialization")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_http_resolver,
+        init_spec_resolver=_init_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    session_id = "conv_rendezvous"
+    payload = {
+        "session_id": session_id,
+        "agent_id": "agent_rendezvous",
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "agent_rendezvous",
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "labels": {},
+            },
+            "agent_bundle": {
+                "version": "1",
+                "name": "rendezvous-agent",
+                "session_scoped": True,
+                "contents_base64": "YnVuZGxl",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        reader = asyncio.create_task(client.get(f"/v1/sessions/{session_id}/models"))
+        await asyncio.sleep(0)
+        assert not reader.done()
+        assert http_calls == 0
+
+        initialization = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await embedded_entered.wait()
+        assert not reader.done()
+        assert http_calls == 0
+
+        release_embedded.set()
+        init_response, reader_response = await asyncio.wait_for(
+            asyncio.gather(initialization, reader),
+            timeout=2.0,
+        )
+
+    assert init_response.status_code == 201
+    assert reader_response.status_code == 200
+    assert http_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_spec_reader_waits_for_legacy_session_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old server's assignment performs one HTTP resolution for all readers."""
+    import omnigent.model_catalog as model_catalog
+
+    monkeypatch.setattr(model_catalog, "catalog_for_spec", lambda _spec: {})
+    resolver_entered = asyncio.Event()
+    release_resolver = asyncio.Event()
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        assert agent_id == "agent_legacy_rendezvous"
+        assert session_id == "conv_legacy_rendezvous"
+        resolver_calls += 1
+        resolver_entered.set()
+        await release_resolver.wait()
+        return AgentSpec(spec_version=1, name="legacy-rendezvous-agent")
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    session_id = "conv_legacy_rendezvous"
+
+    async with _runner_client(app) as client:
+        reader = asyncio.create_task(client.get(f"/v1/sessions/{session_id}/models"))
+        await asyncio.sleep(0)
+        assert not reader.done()
+        assert resolver_calls == 0
+
+        initialization = asyncio.create_task(
+            client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "agent_legacy_rendezvous",
+                },
+            )
+        )
+        await resolver_entered.wait()
+        assert resolver_calls == 1
+        assert not reader.done()
+
+        release_resolver.set()
+        init_response, reader_response = await asyncio.wait_for(
+            asyncio.gather(initialization, reader),
+            timeout=2.0,
+        )
+
+    assert init_response.status_code == 201
+    assert reader_response.status_code == 200
+    assert resolver_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_create_session_falls_back_when_embedded_agent_bundle_is_invalid(
     tmp_path: Path,
 ) -> None:
