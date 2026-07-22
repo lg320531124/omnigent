@@ -78,7 +78,7 @@ import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
 import { readHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { readDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
-import { useBrainHarnessLabels } from "@/lib/agentLabels";
+import { AUTO_HARNESS_ID, useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -2732,6 +2732,9 @@ export function NewChatLandingScreen() {
     (harness: string | null, agentId?: string) => {
       setPickedHarness(harness);
       writeLastHarness(agentId ?? effectiveAgentId, harness);
+      // "Auto" harness delegates model selection to the router — light up
+      // the routing icon to signal that; deselecting auto turns it back off.
+      _setCostControlMode(harness === AUTO_HARNESS_ID ? "on" : null);
     },
     [effectiveAgentId],
   );

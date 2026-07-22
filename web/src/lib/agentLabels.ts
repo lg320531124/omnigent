@@ -60,7 +60,7 @@ export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<strin
   const base = data ?? BRAIN_HARNESS_LABELS;
   if (!smartRoutingEnabled) return base;
   // Prepend the "auto" sentinel so it appears first in the picker.
-  return { [AUTO_HARNESS_ID]: "Auto · smart routing", ...base };
+  return { [AUTO_HARNESS_ID]: "Auto", ...base };
 }
 
 /**

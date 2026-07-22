@@ -545,10 +545,27 @@ async def route_session_harness(
     if result is None:
         return None, None, None
 
-    # Use the router's harness pick when it names one of our candidates;
-    # otherwise fall back to the harness that owns the returned model.
-    chosen_harness = result.harness if result.harness in harness_models else None
-    if chosen_harness is None:
+    # Use the router's harness pick when it names one of our candidates AND
+    # the chosen model is in that harness's model list. If the router returns
+    # a harness/model mismatch (e.g. harness="codex" with a Claude model id),
+    # fall back to finding the harness that actually owns the model.
+    if result.harness in harness_models and result.model in harness_models[result.harness]:
+        chosen_harness = result.harness
+    else:
+        if result.harness and result.harness not in harness_models:
+            _logger.debug(
+                "smart_routing: router harness %r not in candidate set; "
+                "falling back to model-ownership lookup",
+                result.harness,
+            )
+        elif result.harness and result.model not in harness_models.get(result.harness, []):
+            _logger.debug(
+                "smart_routing: router harness %r does not own model %r; "
+                "falling back to model-ownership lookup",
+                result.harness,
+                result.model,
+            )
+        chosen_harness = None
         for h, models in harness_models.items():
             if result.model in models:
                 chosen_harness = h
