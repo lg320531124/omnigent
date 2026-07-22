@@ -13,9 +13,8 @@ The LLM calls are served by the in-process mock LLM server rather than a real
 Anthropic endpoint. Before each test run a mock ``anthropic`` provider config is
 written to ``~/.omnigent/config.yaml`` (see ``native_claude_mock_session`` in
 ``conftest.py``), redirecting the runner's ``ANTHROPIC_BASE_URL`` to the mock
-server. Tokens are pre-generated and queued via content-based routing so the
-mock returns the expected assistant token for each turn regardless of how many
-extra LLM calls Claude Code makes internally.
+server. The session fixture absorbs Claude's initialization request before the
+test scripts the three expected assistant tokens.
 """
 
 from __future__ import annotations
@@ -55,7 +54,7 @@ _TERMINAL_READY_TIMEOUT_MS = 120_000
 
 # Must match the model set in the mock anthropic provider config written by the
 # native_claude_mock_session fixture (conftest._CLAUDE_MOCK_MODEL).
-_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 
 # Two composer turns (the IN direction) + one TUI turn (the OUT direction).
 _COMPOSER_TURNS = 2
@@ -114,22 +113,17 @@ def test_native_claude_message_render_parity(
     _log.info("Claude Code TUI attached (terminal-view connected)")
     _ensure_chat_view(page)
 
-    # Pre-generate tokens for all turns so they can be queued in the mock
-    # before any message is sent. Content-based routing (match=user_marker)
-    # ensures the right token is returned regardless of extra internal calls.
+    # The fixture starts Claude before this queue is configured, so only the
+    # three visible turns belong in this test's queue.
     nonces = [uuid.uuid4().hex[:8] for _ in range(_COMPOSER_TURNS + 1)]
     turns = [
         (f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}")
         for i in range(_COMPOSER_TURNS + 1)
     ]
     reset_mock_llm(mock_llm_server_url)
-    for user_marker, assistant_token in turns:
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": assistant_token}],
-            key=user_marker,
-            match=user_marker,
-        )
+    scripted_responses = [{"text": assistant_token} for _, assistant_token in turns]
+    configure_mock_llm(mock_llm_server_url, scripted_responses, key="default")
+    set_fallback_mock_llm(mock_llm_server_url, "default", "")
     set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "")
 
     user_markers: list[str] = []
